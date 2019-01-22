@@ -16,16 +16,16 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <stdio.h>
-#include <stdlib.h>
+#include <bits/stdc++.h>
+//#include <stdio.h>
+//#include <stdlib.h>
 #include <string.h>
 
 #define BASE64_LENGTH(src_len) (4 * (((src_len) + 2) / 3))
 
 #include "common.h"
 #include "auth.h"
-
+using namespace std;
 
     /* globals */
 

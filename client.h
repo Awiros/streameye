@@ -20,9 +20,13 @@
 #ifndef __CLIENT_H
 #define __CLIENT_H
 
-typedef struct {
+#include "types.h"
+#include <pthread.h>
+
+struct client_t {
     int             stream_fd;
-    char            addr[INET_ADDRSTRLEN];
+    //char            addr[INET_ADDRSTRLEN];
+    char            addr[600];
     int             port;
     char            method[10];
     char            http_ver[10];
@@ -37,7 +41,9 @@ typedef struct {
 
     double          frame_int;
     double          last_frame_time;
-} client_t;
+
+    seye_srv_t*     psrv;
+};
 
 void                handle_client(client_t *client);
 

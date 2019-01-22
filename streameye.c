@@ -16,9 +16,9 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <stdio.h>
-#include <stdlib.h>
+#include <bits/stdc++.h>
+//#include <stdio.h>
+//#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -35,40 +35,42 @@
 #include "common.h"
 #include "streameye.h"
 #include "auth.h"
-
-
     /* locals */
+#include <sys/syscall.h>
+
+
+#define server_add "localhost"
 
 static int client_timeout = DEF_CLIENT_TIMEOUT;
 static int max_clients = 0;
-static int tcp_port = 0;
+static int g_tcp_port = 0;
 static int listen_localhost = 0;
-static char *input_separator = NULL;
-static client_t **clients = NULL;
-static int num_clients = 0;
+static char *g_input_separator = NULL;
 
+extern const char *SERVER_ADD;
 
     /* globals */
-
+int DEF_TCP_PORT = 8080;
 int log_level = 1; /* 0 - quiet, 1 - info, 2 - debug */
-char jpeg_buf[JPEG_BUF_LEN];
-int jpeg_size = 0;
-int running = 1;
-pthread_cond_t jpeg_cond;
-pthread_mutex_t jpeg_mutex;
-pthread_mutex_t clients_mutex;
+int g_running = 1;
 
 
     /* local functions */
 
-static int          init_server();
-static client_t *   wait_for_client(int socket_fd);
+static int          init_server(seye_srv_t *psrv);
+static client_t *   wait_for_client(int socket_fd, seye_srv_t *psrv);
 static void         print_help();
 
+int gettid_syscall_stream()
+{
+  pid_t tid;
+
+  tid = syscall(SYS_gettid);
+  return (int) tid;
+}
 
     /* server socket */
-
-int init_server() {
+int init_server(seye_srv_t *psrv) {
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
         ERRNO("socket() failed");
@@ -80,16 +82,18 @@ int init_server() {
         ERRNO("setsockopt() failed");
         return -1;
     }
-
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
+    /*
     if (listen_localhost) {
-        server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        server_addr.sin_addr.s_addr = inet_addr(server_add);
     }
     else {
         server_addr.sin_addr.s_addr = INADDR_ANY;
     }
-    server_addr.sin_port = htons(tcp_port);
+    */
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(psrv->tcp_port);
 
     if (bind(socket_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) < 0) {
         ERRNO("bind() failed");
@@ -112,60 +116,61 @@ int init_server() {
     return socket_fd;
 }
 
-client_t *wait_for_client(int socket_fd) {
-    struct sockaddr_in client_addr;
-    unsigned int client_len = sizeof(client_addr);
+client_t *wait_for_client(int socket_fd, seye_srv_t *psrv) {
+  struct sockaddr_in client_addr;
+  unsigned int client_len = sizeof(client_addr);
 
-    /* wait for a connection */
-    int stream_fd = accept(socket_fd, (struct sockaddr *) &client_addr, &client_len);
-    if (stream_fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            ERRNO("accept() failed");
-        }
-
-        return NULL;
+  /* wait for a connection */
+  int stream_fd = accept(socket_fd, (struct sockaddr *) &client_addr, &client_len);
+  if (stream_fd < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ERRNO("accept() failed");
     }
 
-    /* set socket timeout */
-    struct timeval tv;
+    return NULL;
+  }
 
-    tv.tv_sec = client_timeout;
-    tv.tv_usec = 0;
+  /* set socket timeout */
+  struct timeval tv;
 
-    setsockopt(stream_fd, SOL_SOCKET, SO_RCVTIMEO, (char *) &tv, sizeof(struct timeval));
-    setsockopt(stream_fd, SOL_SOCKET, SO_SNDTIMEO, (char *) &tv, sizeof(struct timeval));
+  tv.tv_sec = client_timeout;
+  tv.tv_usec = 0;
 
-    /* create client structure */
-    client_t *client = malloc(sizeof(client_t));
-    if (!client) {
-        ERROR("malloc() failed");
-        return NULL;
-    }
+  setsockopt(stream_fd, SOL_SOCKET, SO_RCVTIMEO, (char *) &tv, sizeof(struct timeval));
+  setsockopt(stream_fd, SOL_SOCKET, SO_SNDTIMEO, (char *) &tv, sizeof(struct timeval));
 
-    memset(client, 0, sizeof(client_t));
+  /* create client structure */
+  client_t *client = (client_t*)malloc(sizeof(client_t));
+  if (!client) {
+    ERROR("malloc() failed");
+    return NULL;
+  }
 
-    client->stream_fd = stream_fd;
-    inet_ntop(AF_INET, &client_addr.sin_addr.s_addr, client->addr, INET_ADDRSTRLEN);
-    client->port = ntohs(client_addr.sin_port);
+  memset(client, 0, sizeof(client_t));
 
-    INFO("new client connection from %s:%d", client->addr, client->port);
+  client->stream_fd = stream_fd;
+  client->psrv = psrv;
+  inet_ntop(AF_INET, &client_addr.sin_addr.s_addr, client->addr, INET_ADDRSTRLEN);
+  client->port = ntohs(client_addr.sin_port);
 
-    return client;
+  INFO("new client connection from %s:%d", client->addr, client->port);
+
+  return client;
 }
 
-void cleanup_client(client_t *client) {
+void cleanup_client(client_t *client, seye_srv_t *psrv) {
     DEBUG_CLIENT(client, "cleaning up");
 
-    if (pthread_mutex_lock(&clients_mutex)) {
+    if (pthread_mutex_lock(&(psrv->clients_mutex))) {
         ERROR("pthread_mutex_lock() failed");
     }
 
     int i, j;
-    for (i = 0; i < num_clients; i++) {
-        if (clients[i] == client) {
+    for (i = 0; i < psrv->num_clients; i++) {
+        if (psrv->clients[i] == client) {
             /* move all further entries back with one position */
-            for (j = i; j < num_clients - 1; j++) {
-                clients[j] = clients[j + 1];
+            for (j = i; j < psrv->num_clients - 1; j++) {
+                psrv->clients[j] = psrv->clients[j + 1];
             }
 
             break;
@@ -181,10 +186,10 @@ void cleanup_client(client_t *client) {
     }
     free(client);
 
-    clients = realloc(clients, sizeof(client_t *) * (--num_clients));
-    DEBUG("current clients: %d", num_clients);
+    psrv->clients = (client_t**)realloc(psrv->clients, sizeof(client_t *) * (--(psrv->num_clients)));
+    DEBUG("current clients: %d", psrv->num_clients);
 
-    if (pthread_mutex_unlock(&clients_mutex)) {
+    if (pthread_mutex_unlock(&(psrv->clients_mutex))) {
         ERROR("pthread_mutex_unlock() failed");
     }
 }
@@ -229,120 +234,26 @@ double get_now() {
 }
 
 void bye_handler(int signal) {
-    if (!running) {
+    if (!g_running) {
         INFO("interrupt already received, ignoring signal");
         return;
     }
 
     INFO("interrupt received, quitting");
-    running = 0;
+    g_running = 0;
 }
 
-int main(int argc, char *argv[]) {
-
-    /* read command line arguments */
-    int c;
-    char *err = NULL;
-    char *p, *q;
-
+int streameye_thread(void *arg) {
+   
+    seye_srv_t *psrv = (seye_srv_t*) arg;
+    
     int auth_mode = AUTH_OFF;
     char *auth_username = NULL;
     char *auth_password = NULL;
     char *auth_realm = NULL;
 
     opterr = 0;
-    while ((c = getopt(argc, argv, "a:c:dhlm:p:qs:t:")) != -1) {
-        switch (c) {
-            case 'a': /* authentication */
-                if (!strcmp(optarg, "basic")) {
-                    auth_mode = AUTH_BASIC;
-                }
-                break;
-
-            case 'c': /* credentials */
-                p = q = optarg;
-                while (*q && *q != ':') {
-                    q++;
-                }
-                auth_username = strndup(p, q - p);
-
-                if (!*q) {
-                    ERROR("invalid credentials");
-                    return -1;
-                }
-                p = q = q + 1;
-                while (*q && *q != ':') {
-                    q++;
-                }
-                auth_password = strndup(p, q - p);
-
-                if (!*q) {
-                    ERROR("invalid credentials");
-                    return -1;
-                }
-                p = q = q + 1;
-                while (*q && *q != ':') {
-                    q++;
-                }
-                auth_realm = strndup(p, q - p);
-
-                break;
-
-            case 'd': /* debug */
-                log_level = 2;
-                break;
-
-            case 'h': /* help */
-                print_help();
-                return 0;
-
-            case 'l': /* listen on localhost */
-                listen_localhost = 1;
-                break;
-
-            case 'm': /* max clients */
-                max_clients = strtol(optarg, &err, 10);
-                if (*err != 0) {
-                    ERROR("invalid clients number \"%s\"", optarg);
-                    return -1;
-                }
-                break;
-
-            case 'p': /* tcp port */
-                tcp_port = strtol(optarg, &err, 10);
-                if (*err != 0) {
-                    ERROR("invalid port \"%s\"", optarg);
-                    return -1;
-                }
-                break;
-
-            case 'q': /* quiet */
-                log_level = 0;
-                break;
-
-            case 's': /* input separator */
-                input_separator = strdup(optarg);
-                break;
-
-            case 't': /* client timeout */
-                client_timeout = strtol(optarg, &err, 10);
-                if (*err != 0) {
-                    ERROR("invalid client timeout \"%s\"", optarg);
-                    return -1;
-                }
-                break;
-
-            case '?':
-                ERROR("unknown or incomplete option \"-%c\"", optopt);
-                return -1;
-
-            default:
-                print_help();
-                return -1;
-        }
-    }
-
-    if (auth_mode) {
+       if (auth_mode) {
         if (!auth_username || !auth_password || !auth_realm) {
             ERROR("credentials are required when using authentication");
             return -1;
@@ -350,21 +261,23 @@ int main(int argc, char *argv[]) {
 
         set_auth(auth_mode, auth_username, auth_password, auth_realm);
     }
-
-    if (!tcp_port) {
-        tcp_port = DEF_TCP_PORT;
+    psrv->tcp_port = 0;
+    if (!psrv->webport) {
+        psrv->tcp_port = DEF_TCP_PORT;
     }
 
+    psrv->tcp_port = psrv->webport; 
+    INFO("tp = %d", psrv->tcp_port);
     INFO("streamEye %s", STREAM_EYE_VERSION);
-    INFO("hello!");
-
-    if (input_separator && strlen(input_separator) < 4) {
+    //server_add_without_port();
+    if (psrv->input_separator && strlen(psrv->input_separator) < 4) {
         INFO("the input separator supplied is very likely to appear in the actual frame data (consider a longer one)");
     }
 
     /* signals */
     DEBUG("installing signal handlers");
     struct sigaction act;
+    g_running = psrv->running; //TODO: hack to pass running to bye_handler, not thread safe
     act.sa_handler = bye_handler;
     act.sa_flags = 0;
     sigemptyset(&act.sa_mask);
@@ -384,31 +297,46 @@ int main(int argc, char *argv[]) {
 
     /* threading */
     DEBUG("initializing thread synchronization");
-    if (pthread_cond_init(&jpeg_cond, NULL)) {
+    if (pthread_cond_init(&(psrv->frame_cond), NULL)) {
+      ERROR("pthread_cond_init() failed");
+      return -1;
+    }
+    if (pthread_mutex_init(&(psrv->frame_mutex), NULL)) {
+      ERROR("pthread_mutex_init() failed");
+      return -1;
+    }
+    if (pthread_cond_init(&(psrv->jpeg_cond), NULL)) {
         ERROR("pthread_cond_init() failed");
         return -1;
     }
-    if (pthread_mutex_init(&jpeg_mutex, NULL)) {
+    if (pthread_mutex_init(&(psrv->jpeg_mutex), NULL)) {
         ERROR("pthread_mutex_init() failed");
         return -1;
     }
-    if (pthread_mutex_init(&clients_mutex, NULL)) {
+    if (pthread_mutex_init(&(psrv->clients_mutex), NULL)) {
         ERROR("pthread_mutex_init() failed");
         return -1;
     }
 
     /* tcp server */
+   // static int start_server = 1;
+    //int socket_fd;
+   // if(start_server == 1)
+   // {
     DEBUG("starting server");
-    int socket_fd = init_server();
+    int socket_fd = init_server(psrv);
     if (socket_fd < 0) {
-        ERROR("failed to start server");
-        return -1;
+	ERROR("failed to start server");
+	return -1;
     }
-
-    INFO("listening on %s:%d", listen_localhost ? "127.0.0.1" : "0.0.0.0", tcp_port);
+     //       start_server = 0;
+   // }
+    //INFO("listening on %s:%d", listen_localhost ? "127.0.0.1" : "0.0.0.0", tcp_port);
+    INFO("listening on %s:%d", listen_localhost ? server_add : "localhost", psrv->tcp_port);
 
     /* main loop */
-    char input_buf[INPUT_BUF_LEN];
+    //char input_buf[INPUT_BUF_LEN];
+    char *input_buf;
     char *sep = NULL;
     int size, rem_len = 0, i;
 
@@ -419,18 +347,49 @@ int main(int argc, char *argv[]) {
 
     int auto_separator = 0;
     int input_separator_len;
-    if (!input_separator) {
+    if (!psrv->input_separator) {
         auto_separator = 1;
         input_separator_len = 4; /* strlen(JPEG_START) + strlen(JPEG_END) */;
-        input_separator = malloc(input_separator_len + 1);
-        snprintf(input_separator, input_separator_len + 1, "%s%s", JPEG_END, JPEG_START);
+        psrv->input_separator = (char*)malloc(input_separator_len + 1);
+        snprintf(psrv->input_separator, input_separator_len + 1, "%s%s", JPEG_END, JPEG_START);
     }
     else {
-        input_separator_len = strlen(input_separator);
+        input_separator_len = strlen(psrv->input_separator);
     }
 
-    while (running) {
-        size = read(STDIN_FILENO, input_buf, INPUT_BUF_LEN);
+    FILE *img;
+    sleep(2);
+    INFO("Streameye Thread Id = %d",gettid_syscall_stream());
+    //while (running) {
+    while (1) {
+
+      if (pthread_mutex_lock(&(psrv->frame_mutex))){
+        std::cerr << "pthread_mutex_lock() failed frame_muted" << std::endl;
+        return -1;
+      }
+      while(!psrv->ready_state){
+        if (pthread_cond_wait(&(psrv->frame_cond), &(psrv->frame_mutex))){
+          std::cerr << "pthread_cond_wait() failed frame_muted" << std::endl;
+          return -1;
+        }
+      }
+      psrv->ready_state = false;
+      if (pthread_mutex_unlock(&(psrv->frame_mutex))){
+        std::cerr << "pthread_mutex_lock() failed frame_muted" << std::endl;
+        return -1;
+      }
+      /*
+      if (psrv->ready_state == false){
+        usleep(10*1000);
+        continue;
+      }
+     */
+      
+      psrv->ready_state = false;
+
+      input_buf = psrv->pimgbuf;
+      size = psrv->bufsize;
+
         if (size < 0) {
             if (errno == EINTR) {
                 break;
@@ -441,57 +400,61 @@ int main(int argc, char *argv[]) {
         }
         else if (size == 0) {
             DEBUG("input: end of stream");
-            running = 0;
+            psrv->running = 0;
             break;
         }
 
-        if (size > JPEG_BUF_LEN - 1 - jpeg_size) {
-            ERROR("input: jpeg size too large, discarding buffer");
-            jpeg_size = 0;
+        if (size > JPEG_BUF_LEN - 1 - psrv->jpeg_size) {
+            ERROR("input: jpeg size too large, discarding buffer %d", size);
+            psrv->jpeg_size = 0;
             continue;
         }
 
-        if (pthread_mutex_lock(&jpeg_mutex)) {
+        if (pthread_mutex_lock(&(psrv->jpeg_mutex))) {
             ERROR("pthread_mutex_lock() failed");
             return -1;
         }
 
         /* clear the ready flag for all clients,
          * as we start building the next frame */
-        for (i = 0; i < num_clients; i++) {
-            clients[i]->jpeg_ready = 0;
+        //TODO may not be suitable for multi threaded sever
+
+        for (i = 0; i < psrv->num_clients; i++) {
+          DEBUG("[%d] clients %d %d %d\n", psrv->tcp_port, psrv->num_clients, psrv->jpeg_size, psrv->clients[i]->stream_fd);
+            psrv->clients[i]->jpeg_ready = 0;
         }
+
 
         if (rem_len) {
             /* copy the remainder of data from the previous iteration back to the jpeg buffer */
-            memmove(jpeg_buf, sep + (auto_separator ? 2 /* strlen(JPEG_END) */ : input_separator_len), rem_len);
-            jpeg_size = rem_len;
+            memmove(psrv->jpeg_buf, sep + (auto_separator ? 2 /* strlen(JPEG_END) */ : input_separator_len), rem_len);
+            psrv->jpeg_size = rem_len;
         }
 
-        memcpy(jpeg_buf + jpeg_size, input_buf, size);
-        jpeg_size += size;
+        memcpy(psrv->jpeg_buf + psrv->jpeg_size, input_buf, size);
+        psrv->jpeg_size += size;
 
         /* look behind at most 2 * INPUT_BUF_LEN for a separator */
-        sep = (char *) memmem(jpeg_buf + jpeg_size - MIN(2 * INPUT_BUF_LEN, jpeg_size), MIN(2 * INPUT_BUF_LEN, jpeg_size),
-                input_separator, input_separator_len);
+        sep = (char *) memmem(psrv->jpeg_buf + psrv->jpeg_size - MIN(2 * INPUT_BUF_LEN, psrv->jpeg_size), MIN(2 * INPUT_BUF_LEN, psrv->jpeg_size),
+                psrv->input_separator, input_separator_len);
 
         if (sep) { /* found a separator, jpeg frame is ready */
             if (auto_separator) {
-                rem_len = jpeg_size - (sep - jpeg_buf) - 2 /* strlen(JPEG_START) */;
-                jpeg_size = sep - jpeg_buf + 2 /* strlen(JPEG_END) */;
+                rem_len = psrv->jpeg_size - (sep - psrv->jpeg_buf) - 2 /* strlen(JPEG_START) */;
+                psrv->jpeg_size = sep - psrv->jpeg_buf + 2 /* strlen(JPEG_END) */;
             }
             else {
-                rem_len = jpeg_size - (sep - jpeg_buf) - input_separator_len;
-                jpeg_size = sep - jpeg_buf;
+                rem_len = psrv->jpeg_size - (sep - psrv->jpeg_buf) - input_separator_len;
+                psrv->jpeg_size = sep - psrv->jpeg_buf;
             }
 
-            DEBUG("input: jpeg buffer ready with %d bytes", jpeg_size);
+            DEBUG("input: jpeg buffer ready with %d bytes", psrv->jpeg_size);
 
             /* set the ready flag and notify all client threads about it */
-            for (i = 0; i < num_clients; i++) {
-                clients[i]->jpeg_ready = 1;
+            for (i = 0; i < psrv->num_clients; i++) {
+                psrv->clients[i]->jpeg_ready = 1;
             }
-            if (pthread_cond_broadcast(&jpeg_cond)) {
+            if (pthread_cond_broadcast(&(psrv->jpeg_cond))) {
                 ERROR("pthread_cond_broadcast() failed");
                 return -1;
             }
@@ -504,7 +467,7 @@ int main(int argc, char *argv[]) {
             rem_len = 0;
         }
 
-        if (pthread_mutex_unlock(&jpeg_mutex)) {
+        if (pthread_mutex_unlock(&(psrv->jpeg_mutex))) {
             ERROR("pthread_mutex_unlock() failed");
             return -1;
         }
@@ -512,11 +475,11 @@ int main(int argc, char *argv[]) {
         if (sep) {
             DEBUG("current fps: %.01lf", 1 / frame_int);
 
-            if (num_clients) {
-                min_client_frame_int = clients[0]->frame_int;
-                for (i = 0; i < num_clients; i++) {
-                    if (clients[i]->frame_int < min_client_frame_int) {
-                        min_client_frame_int = clients[i]->frame_int;
+            if (psrv->num_clients) {
+                min_client_frame_int = psrv->clients[0]->frame_int;
+                for (i = 0; i < psrv->num_clients; i++) {
+                    if (psrv->clients[i]->frame_int < min_client_frame_int) {
+                        min_client_frame_int = psrv->clients[i]->frame_int;
                     }
                 }
 
@@ -536,8 +499,9 @@ int main(int argc, char *argv[]) {
              * with no particular relation to the frame separator we've just found */
             client_t *client = NULL;
 
-            if (!max_clients || num_clients < max_clients) {
-                client = wait_for_client(socket_fd);
+            if (!max_clients || psrv->num_clients < max_clients) {
+                //INFO("Socket fd = %d", socket_fd);
+                client = wait_for_client(socket_fd, psrv);
             }
 
             if (client) {
@@ -546,17 +510,17 @@ int main(int argc, char *argv[]) {
                     return -1;
                 }
 
-                if (pthread_mutex_lock(&clients_mutex)) {
+                if (pthread_mutex_lock(&(psrv->clients_mutex))) {
                     ERROR("pthread_mutex_lock() failed");
                     return -1;
                 }
 
-                clients = realloc(clients, sizeof(client_t *) * (num_clients + 1));
-                clients[num_clients++] = client;
+                psrv->clients = (client_t**)realloc(psrv->clients, sizeof(client_t *) * (psrv->num_clients + 1));
+                psrv->clients[psrv->num_clients++] = client;
 
-                DEBUG("current clients: %d", num_clients);
+                DEBUG("current clients: %d", psrv->num_clients);
 
-                if (pthread_mutex_unlock(&clients_mutex)) {
+                if (pthread_mutex_unlock(&(psrv->clients_mutex))) {
                     ERROR("pthread_mutex_unlock() failed");
                     return -1;
                 }
@@ -564,36 +528,45 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    running = 0;
+    psrv->running = 0;
 
     DEBUG("closing server");
     close(socket_fd);
 
     DEBUG("waiting for clients to finish");
-    for (i = 0; i < num_clients; i++) {
-        clients[i]->jpeg_ready = 1;
+    for (i = 0; i < psrv->num_clients; i++) {
+        psrv->clients[i]->jpeg_ready = 1;
     }
-    if (pthread_cond_broadcast(&jpeg_cond)) {
+    if (pthread_cond_broadcast(&(psrv->jpeg_cond))) {
         ERROR("pthread_cond_broadcast() failed");
         return -1;
     }
 
-    for (i = 0; i < num_clients; i++) {
-        pthread_join(clients[i]->thread, NULL);
+    for (i = 0; i < psrv->num_clients; i++) {
+        pthread_join(psrv->clients[i]->thread, NULL);
     }
 
-    if (pthread_mutex_destroy(&clients_mutex)) {
+    if (pthread_mutex_destroy(&(psrv->clients_mutex))) {
         ERROR("pthread_mutex_destroy() failed");
         return -1;
     }
-    if (pthread_mutex_destroy(&jpeg_mutex)) {
+    if (pthread_mutex_destroy(&(psrv->jpeg_mutex))) {
         ERROR("pthread_mutex_destroy() failed");
         return -1;
     }
-    if (pthread_cond_destroy(&jpeg_cond)) {
+    if (pthread_cond_destroy(&(psrv->jpeg_cond))) {
         ERROR("pthread_cond_destroy() failed");
         return -1;
     }
+    if (pthread_mutex_destroy(&(psrv->frame_mutex))) {
+        ERROR("pthread_mutex_destroy() failed");
+        return -1;
+    }
+    if (pthread_cond_destroy(&(psrv->frame_cond))) {
+        ERROR("pthread_cond_destroy() failed");
+        return -1;
+    }
+
 
     INFO("bye!");
 

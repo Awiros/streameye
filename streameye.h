@@ -35,7 +35,37 @@
 #define JPEG_START              "\xFF\xD8"
 #define JPEG_END                "\xFF\xD9"
 
-void                            cleanup_client(client_t *client);
+#include <pthread.h>
 
+struct seye_srv_t{
+
+  int       ready_state;
+  int       frame_no;
+  int       id;
+  char      *pimgbuf;
+  int       bufsize;
+  int       webport;
+  int       running=1;
+  char      jpeg_buf[JPEG_BUF_LEN];
+  int       jpeg_size;
+
+  client_t  **clients = NULL;
+  int       num_clients = 0;
+
+  char      *input_separator=NULL;
+  int       tcp_port;
+
+
+  pthread_cond_t frame_cond;
+  pthread_mutex_t frame_mutex;
+
+  pthread_cond_t jpeg_cond;
+  pthread_mutex_t jpeg_mutex;
+  pthread_mutex_t clients_mutex;
+};
+
+void        handle_client(client_t *client);
+void        cleanup_client(client_t *client) seye_srv_t;
+int         streameye_thread(void *arg);
 
 #endif /* __STREAMEYE_H */
